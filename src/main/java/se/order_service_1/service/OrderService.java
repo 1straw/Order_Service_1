@@ -1,15 +1,15 @@
 package se.order_service_1.service;
 
-import io.github.cdimascio.dotenv.Dotenv;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.client.RestTemplate;
-import se.order_service_1.dto.PlaceOrderRequest;
-import se.order_service_1.dto.PaymentRequest;
+import se.order_service_1.client.ReservationClient;
+import se.order_service_1.dto.*;
 import se.order_service_1.exception.OrderCompletedException;
 import se.order_service_1.exception.OrderNotFoundException;
 import se.order_service_1.model.OrderItem;
@@ -17,7 +17,6 @@ import se.order_service_1.model.Order;
 import se.order_service_1.repository.OrderItemRepository;
 import se.order_service_1.repository.OrderRepository;
 
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,11 +29,12 @@ public class OrderService {
     private final OrderItemRepository orderItemRepository;
     private final PaymentService paymentService;
     private final RestTemplate restTemplate;
+    private final ReservationClient reservationClient;
 
     @Value("${product.service.address}")
-    private String productServiceAddress; // = Dotenv.load().get("PRODUCT_SERVICE_ADDRESS");
+    private String productServiceAddress;
 
-
+    @Transactional
     public void addOrderItem(Long orderId, Long productId, int quantity) {
         log.debug("addOrderItem - försök lägga till produkt {} (qty={}) till orderId={}",
                 productId, quantity, orderId);
@@ -50,8 +50,10 @@ public class OrderService {
         List<OrderItem> items = orderItemRepository.findByOrderId(orderId);
         log.debug("addOrderItem - orderId={} har {} items före uppdatering", orderId, items.size());
 
-        for(OrderItem item : items){
+        // Skapa en reservation för produkten
+        reserveProductsForOrder(orderId, productId, quantity);
 
+        for(OrderItem item : items){
             if(item.getProductId().equals(productId)){
                 log.info("addOrderItem - produkt {} finns redan i orderId={}, uppdaterar qty {} -> {}",
                         productId, orderId, item.getQuantity(), item.getQuantity() + quantity);
@@ -73,7 +75,22 @@ public class OrderService {
                 newItem.getProductId(), orderId, quantity);
 
         log.debug("addOrderItem - orderId={} sparad med nytt item, total items={}", orderId, items.size());
+    }
 
+    private void reserveProductsForOrder(Long orderId, Long productId, int quantity) {
+        // Skapa en reservation för produkten
+        List<ProductReservation> productReservations = new ArrayList<>();
+        productReservations.add(ProductReservation.builder()
+                .productId(productId)
+                .quantity(quantity)
+                .build());
+
+        ReservationRequest request = ReservationRequest.builder()
+                .orderId(orderId)
+                .productReservations(productReservations)
+                .build();
+
+        reservationClient.reserveProducts(request);
     }
 
     public List<OrderItem> getOrderItems(Long orderId) {
@@ -88,11 +105,16 @@ public class OrderService {
         return orders;
     }
 
+    @Transactional
     public void deleteOrder(Long orderId) {
         log.info("deleteOrder - försök radera order med id={}", orderId);
         if(orderRepository.existsById(orderId)){
             Order order = getOrderById(orderId);
             checkNotCompleted(order);
+
+            // Avbryt reservationerna först
+            reservationClient.cancelReservations(orderId);
+
             List<OrderItem> items = orderItemRepository.findByOrderId(orderId);
             orderItemRepository.deleteAll(items);
             orderRepository.deleteById(orderId);
@@ -119,18 +141,53 @@ public class OrderService {
         return orders;
     }
 
+    @Transactional
     public Order updateOrder(Long orderID, Long productID, Integer quantity) {
         Order order = getOrderById(orderID);
         checkNotCompleted(order);
+
         List<OrderItem> orderItems = getOrderItems(orderID);
-        for(OrderItem orderItem : orderItems){
-            if(orderItem.getProductId().equals(productID)){
-                orderItem.setQuantity(quantity);
-                orderItemRepository.save(orderItem);
-                return order;
+
+        // Om kvantiteten är positiv, uppdatera eller lägg till
+        if (quantity > 0) {
+            for(OrderItem orderItem : orderItems){
+                if(orderItem.getProductId().equals(productID)){
+                    // Beräkna differensen
+                    int diff = quantity - orderItem.getQuantity();
+
+                    // Om differensen är positiv, vi behöver reservera mer
+                    if (diff > 0) {
+                        reserveProductsForOrder(orderID, productID, diff);
+                    }
+                    // Om differensen är negativ, vi behöver frigöra några
+                    else if (diff < 0) {
+                        // Avbryt reservation för differensen (omvandla till positivt tal)
+                        reservationClient.cancelProductReservation(orderID, productID, -diff);
+                    }
+
+                    orderItem.setQuantity(quantity);
+                    orderItemRepository.save(orderItem);
+                    return order;
+                }
+            }
+
+            // Om produkten inte finns i ordern, lägg till den
+            addOrderItem(orderID, productID, quantity);
+        }
+        // Om kvantiteten är 0 eller mindre, ta bort orderItem
+        else {
+            for(OrderItem orderItem : orderItems){
+                if(orderItem.getProductId().equals(productID)){
+                    // Avbryt reservation för denna produkt
+                    reservationClient.cancelProductReservation(orderID, productID, orderItem.getQuantity());
+
+                    // Ta bort orderItem
+                    orderItemRepository.delete(orderItem);
+                    break;
+                }
             }
         }
-        addOrderItem(orderID, productID, quantity);
+
         return order;
     }
 
@@ -140,13 +197,15 @@ public class OrderService {
      * @param paymentRequest betalningsuppgifter
      * @return transaktions-ID för betalningen
      */
+    @Transactional
     public String finalizeOrder(Long orderId, PaymentRequest paymentRequest) {
         log.info("finalizeOrder - försök slutföra order med id={}", orderId);
 
         Order order = getOrderById(orderId);
         checkNotCompleted(order);
 
-        updateProductQuantities(orderId);
+        // Bekräfta reservationer i ProductService
+        reservationClient.confirmReservations(orderId);
 
         // Beräkna ordersumma
         Double totalBelopp = calculateOrderTotal(orderId);
@@ -171,25 +230,6 @@ public class OrderService {
         return orderRepository.findByUserIdAndOrderDateAfter(userId, orderDate);
     }
 
-    //Testa att uppdatera Product_Services inventory
-    //If failed throws exception
-    private void updateProductQuantities(Long orderId) {
-        List<PlaceOrderRequest.ProductChange> productChangeList = new ArrayList<>();
-        PlaceOrderRequest.ProductChange productChange;
-        for(OrderItem orderItem : orderItemRepository.findByOrderId(orderId)){
-            productChange = PlaceOrderRequest.ProductChange.builder()
-                    .productId(orderItem.getProductId())
-                    .inventoryChange(-orderItem.getQuantity())
-                    .build();
-            productChangeList.add(productChange);
-        }
-        PlaceOrderRequest placeOrderRequest = new PlaceOrderRequest(productChangeList);
-        String url = productServiceAddress + "/product/inventoryManager";
-
-        //Send change to product-service and see if it can be changed
-        ResponseEntity<String> response = restTemplate.postForEntity(url, placeOrderRequest, String.class);
-    }
-
     /**
      * Beräknar totalsumman för en order
      * OBS: I ett riktigt system skulle detta hämta produktpriser från Product Service
@@ -211,6 +251,7 @@ public class OrderService {
     }
 
     // Temporär funktion för testning
+    @Transactional
     public Order createOrder(Long userId){
         Order order = Order.builder()
                 .userId(userId)

@@ -1,6 +1,7 @@
 package se.order_service_1.config;
 
 import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
@@ -15,7 +16,12 @@ import javax.crypto.SecretKey;
 @EnableMethodSecurity
 public class SecurityConfig {
 
-    private final String jwtSecret = System.getenv("JWT_SECRET"); // or inject via @Value("${JWT_SECRET}")
+    private final String jwtSecret;
+
+    // Injektion via konstruktor för att säkerställa att värdet finns
+    public SecurityConfig(@Value("${jwt.secret}") String jwtSecret) {
+        this.jwtSecret = jwtSecret;
+    }
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -32,9 +38,13 @@ public class SecurityConfig {
         return http.build();
     }
 
-
     @Bean
     public JwtDecoder jwtDecoder() {
+        // Kontrollera att jwtSecret inte är null innan vi fortsätter
+        if (jwtSecret == null || jwtSecret.trim().isEmpty()) {
+            throw new IllegalStateException("JWT Secret is not configured properly. Check your environment variables or application.properties.");
+        }
+
         byte[] keyBytes = Base64.getDecoder().decode(jwtSecret);
         SecretKey secretKey = Keys.hmacShaKeyFor(keyBytes);
         return NimbusJwtDecoder.withSecretKey(secretKey).build();
